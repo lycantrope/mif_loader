@@ -128,14 +128,17 @@ def load_mif_channel(
         else:
             batch_data = data[None, ...]
 
+        if "C" in dims:
+            # extract C from C
+            assert dims["C"] >= useC, f"{useC} is invalid"
+            batch_data = np.take(batch_data, axis=axes_to_idx["C"], indices=useC - 1)
+
         if flipX:
             batch_data = np.flip(batch_data, -1)
         if flipY:
             batch_data = np.flip(batch_data, -2)
 
         for src in batch_data:
-            if "C" in dims:
-                src = np.take(src, axis=axes_to_idx["C"], indices=useC)
 
             # wrapping single channel in list to make it iterable.
             if "Z" not in dims:
