@@ -148,13 +148,15 @@ def load_mif_channel(
             # This moves the loop into C++ internal logic
             final_z_stack = np.zeros((expected_z, height, width), dtype=src.dtype)
             for i, slice_z in enumerate(src):
+                z_min = np.min(slice_z).item()
                 cv2.remap(
                     src=slice_z,
                     map1=map_x,
                     map2=map_y,
                     interpolation=cv2.INTER_CUBIC,
                     dst=final_z_stack[i + padZ],
-                    borderMode=cv2.BORDER_REPLICATE,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=z_min,
                 )
 
             yield final_z_stack
