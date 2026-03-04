@@ -60,7 +60,7 @@ def load_mif_channel(
     with tifffile.TiffFile(path) as tif:
         axes = tif.series[0].axes.upper()
 
-    assert axes in ("TZCYX", "ZCYX", "ZYX", "YX"), axes
+    assert axes.endswith("YX"), axes
 
     data = tifffile.memmap(path, mode="r")
     shape = data.shape
@@ -73,6 +73,8 @@ def load_mif_channel(
         raise ValueError(
             f"Metadata axes {axes} ({len(axes)}) don't match data shape {shape} ({len(shape)})"
         )
+
+    axes_to_idx = {c: i for i, c in enumerate(axes)}
     dims = {c: shape[i] for i, c in enumerate(axes)}
 
     target_c_idx = useC - 1
@@ -121,8 +123,8 @@ def load_mif_channel(
 
     for batch in batched_idx:
         # we read a batch of data to reduce the io access
-        if "T" in dims:
-            batch_data = data[batch]
+        if "T" in axes_to_idx:
+            batch_data = np.take(data, axis=axes_to_idx["T"], indices=batch)
         else:
             batch_data = data[None, ...]
 
@@ -133,11 +135,11 @@ def load_mif_channel(
 
         for src in batch_data:
             if "C" in dims:
-                src = src[useC - 1]
+                src = np.take(src, axis=axes_to_idx["C"], indices=useC)
 
             # wrapping single channel in list to make it iterable.
             if "Z" not in dims:
-                src = src[None, ...]
+                src = [src]
 
             # 3. Apply the map to all slices in the Z-stack
             # This moves the loop into C++ internal logic
