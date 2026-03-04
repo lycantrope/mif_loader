@@ -1,0 +1,12 @@
+[project]
+name = "mif-loader"
+version = "0.1.0"
+description = "MIFLoader provide the python utils to read the ImageJ tiff from MIF metafile"
+readme = "README.md"
+authors = [{ name = "Chung-Kuan Chen", email = "b97b01045@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = ["numpy", "opencv-python-headless", "tifffile"]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
