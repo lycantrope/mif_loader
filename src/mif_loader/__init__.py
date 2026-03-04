@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 import tifffile
 
-
 def rigid(sx: float, sy: float, rot: float, tx: float, ty: float) -> np.ndarray:
     scale = np.array(
         [
