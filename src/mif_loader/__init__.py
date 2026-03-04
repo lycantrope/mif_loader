@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import tifffile
 
+
 def rigid(sx: float, sy: float, rot: float, tx: float, ty: float) -> np.ndarray:
     scale = np.array(
         [
@@ -59,7 +60,7 @@ def load_mif_channel(
     with tifffile.TiffFile(path) as tif:
         axes = tif.series[0].axes.upper()
 
-    assert axes in ("TCZYX", "CZYX", "ZYX", "YX")
+    assert axes in ("TZCYX", "ZCYX", "ZYX", "YX"), axes
 
     data = tifffile.memmap(path, mode="r")
     shape = data.shape
@@ -209,6 +210,7 @@ class MIFLoader:
         self.channel_props = {int(k): v for k, v in channel_props.items()}
 
     def iter(self, order: Optional[Sequence[int]] = None) -> Generator[np.ndarray]:
+        """Yield the image stack with axes (C, Z, Y, X)"""
         if order is None:
             order = sorted(self.channel_props.keys())
         T, C, Z, Y, X = self.shape
