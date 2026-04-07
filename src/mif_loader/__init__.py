@@ -84,11 +84,9 @@ def load_mif_channel(
         )
 
     actual_z = dims.get("Z", 1)
-    expected_z = padZ + actual_z
-    if slices != expected_z:
-        raise ValueError(
-            f"Z-Slice Mismatch: MIF expects {slices}, calculation gives {expected_z}"
-        )
+    expected_z = actual_z - padZ
+    if padZ >= actual_z and (actual_z - padZ) == slices:
+        raise ValueError(f"Z-Slice Mismatch: MIF expects {padZ} < {actual_z}")
     M = rigid(scaleX, scaleY, rotXY, transX, transY)
     M_inv = np.linalg.inv(M)
 
@@ -144,19 +142,18 @@ def load_mif_channel(
             if "Z" not in dims:
                 src = [src]
 
+            src = src[padZ:actual_z]
             # 3. Apply the map to all slices in the Z-stack
             # This moves the loop into C++ internal logic
-            final_z_stack = np.zeros((expected_z, height, width), dtype=src.dtype)
+            final_z_stack = np.zeros((expected_z, height, width), dtype=src[0].dtype)
             for i, slice_z in enumerate(src):
-                z_min = np.min(slice_z).item()
                 cv2.remap(
                     src=slice_z,
                     map1=map_x,
                     map2=map_y,
                     interpolation=cv2.INTER_CUBIC,
-                    dst=final_z_stack[i + padZ],
+                    dst=final_z_stack[i],
                     borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=z_min,
                 )
 
             yield final_z_stack
