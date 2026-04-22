@@ -61,10 +61,9 @@ def load_mif_channel(
         axes = tif.series[0].axes.upper()
 
     assert axes.endswith("YX"), axes
-
     data = tifffile.memmap(path, mode="r")
     shape = data.shape
-
+    print(f"src:{Path(path).name}, shape:{shape}, dtype:{data.dtype}, axes: {axes}")
     # Instead of: assert len(axes) == len(shape)
     # Try forcing them to match:
     if len(axes) != len(shape):
@@ -127,9 +126,14 @@ def load_mif_channel(
             batch_data = data[None, ...]
 
         if "C" in dims:
-            # extract C from C
             assert dims["C"] >= useC, f"{useC} is invalid"
-            batch_data = np.take(batch_data, axis=axes_to_idx["C"], indices=useC - 1)
+            # Add 1 if channel T was padded in the first dimension.
+            C_idx = axes_to_idx["C"] + int("T" not in axes_to_idx)
+            batch_data = np.take(
+                batch_data,
+                axis=C_idx,
+                indices=useC - 1,
+            )
 
         if flipX:
             batch_data = np.flip(batch_data, -1)
@@ -145,10 +149,12 @@ def load_mif_channel(
             src = src[padZ:actual_z]
             # 3. Apply the map to all slices in the Z-stack
             # This moves the loop into C++ internal logic
-            final_z_stack = np.zeros((expected_z, height, width), dtype=src[0].dtype)
+            # Converting data type to little endian
+            dtype = src[0].dtype.newbyteorder("L")
+            final_z_stack = np.zeros((expected_z, height, width), dtype=dtype)
             for i, slice_z in enumerate(src):
                 cv2.remap(
-                    src=slice_z,
+                    src=slice_z.astype(dtype),
                     map1=map_x,
                     map2=map_y,
                     interpolation=cv2.INTER_CUBIC,
