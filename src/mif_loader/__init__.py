@@ -1,235 +1,279 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
+import typing
 from collections import defaultdict
 from pathlib import Path
-from typing import Generator, Optional, Sequence
 
 import cv2
 import numpy as np
 import tifffile
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
 
+logger = logging.getLogger(__name__)
+
+CANONICAL_AXES = "TCZYX"
+
+# dtypes cv2.warpAffine can handle natively
+_CV2_DTYPES = {
+    np.dtype(t) for t in (np.uint8, np.uint16, np.int16, np.float32, np.float64)
+}
+
+# "key[N] = value;"  (value may contain spaces; trailing whitespace allowed)
+_LINE_RE = re.compile(r"^\s*([A-Za-z]+)(\d+)?\s*=\s*(.+?)\s*;\s*$")
+
+
+# --------------------------------------------------------------------------- #
+# Geometry
+# --------------------------------------------------------------------------- #
 def rigid(sx: float, sy: float, rot: float, tx: float, ty: float) -> np.ndarray:
-    scale = np.array(
+    """3x3 homogeneous matrix: scale, then rotate (radians), then translate.
+
+    Equivalent to ``translate @ rotate @ scale``.
+    """
+    c, s = np.cos(rot), np.sin(rot)
+    return np.array(
         [
-            [sx, 0.0, 0.0],
-            [0.0, sy, 0.0],
-            [0.0, 0.0, 1.0],
-        ]
-    )
-    cos, sin = np.cos(rot), np.sin(rot)
-    rotate = np.array(
-        [
-            [cos, -sin, 0.0],
-            [sin, cos, 0.0],
-            [0.0, 0.0, 1.0],
-        ]
-    )
-    translate = np.array(
-        [
-            [1.0, 0.0, tx],
-            [0.0, 1.0, ty],
+            [sx * c, -sy * s, tx],
+            [sx * s, sy * c, ty],
             [0.0, 0.0, 1.0],
         ]
     )
 
-    return translate @ rotate @ scale
+
+def _flip_matrix(flip_x: bool, flip_y: bool, src_w: int, src_h: int) -> np.ndarray:
+    """Matrix that mirrors source pixel coordinates (applied before `rigid`)."""
+    return np.array(
+        [
+            [-1.0 if flip_x else 1.0, 0.0, (src_w - 1) if flip_x else 0.0],
+            [0.0, -1.0 if flip_y else 1.0, (src_h - 1) if flip_y else 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
 
 
+# --------------------------------------------------------------------------- #
+# TIFF access
+# --------------------------------------------------------------------------- #
+def _open_tiff(path: Path) -> tuple[np.ndarray, str]:
+    """Return (array, axes) for the first series, memory-mapped when possible."""
+    with tifffile.TiffFile(path) as tif:
+        series = tif.series[0]
+        axes = series.axes.upper()
+        try:
+            data = tifffile.memmap(path, series=0, mode="r")
+        except ValueError:
+            # Compressed / non-contiguous files can't be memory-mapped.
+            logger.warning("%s is not memory-mappable; loading it into RAM.", path.name)
+            data = series.asarray()
+    return data, axes
+
+
+def _to_tczyx(data: np.ndarray, axes: str) -> np.ndarray:
+    """Return a 5-D (T, C, Z, Y, X) *view* of `data`, whatever its axis order."""
+    if data.ndim != len(axes):
+        raise ValueError(f"Axes {axes!r} don't match data shape {data.shape}")
+    if not axes.endswith("YX"):
+        raise ValueError(f"Expected axes ending in 'YX', got {axes!r}")
+
+    # Drop size-1 axes we don't model (e.g. 'Q', 'S', 'I'); refuse real data on them.
+    extra = tuple(i for i, a in enumerate(axes) if a not in CANONICAL_AXES)
+    for i in extra:
+        if data.shape[i] != 1:
+            raise ValueError(
+                f"Unsupported axis {axes[i]!r} (size {data.shape[i]}) in {axes!r}"
+            )
+    data = np.squeeze(data, axis=extra)
+    axes = "".join(a for a in axes if a in CANONICAL_AXES)
+
+    # Add missing axes as size-1 dimensions, then reorder.
+    for a in CANONICAL_AXES:
+        if a not in axes:
+            data = data[np.newaxis]
+            axes = a + axes
+    return np.transpose(data, [axes.index(a) for a in CANONICAL_AXES])
+
+
+# --------------------------------------------------------------------------- #
+# Channel loader
+# --------------------------------------------------------------------------- #
 def load_mif_channel(
     height: int,
     width: int,
     frames: int,
     slices: int,
     path: os.PathLike,
-    flipX: bool,
-    flipY: bool,
-    scaleX: float,
-    scaleY: float,
-    rotXY: float,
-    transX: float,
-    transY: float,
-    numC: int,
-    useC: int,
+    flipX: bool = False,
+    flipY: bool = False,
+    scaleX: float = 1.0,
+    scaleY: float = 1.0,
+    rotXY: float = 0.0,
+    transX: float = 0.0,
+    transY: float = 0.0,
+    useC: int = 1,
     padZ: int = 0,
     batchsize: int = 1,
+    interpolation: int = cv2.INTER_LINEAR,
     **kwargs,
-):
-    with tifffile.TiffFile(path) as tif:
-        axes = tif.series[0].axes.upper()
+) -> Iterator[np.ndarray]:
+    """Yield `frames` volumes of shape (slices, height, width) for one channel."""
+    path = Path(path)
+    if kwargs:
+        logger.debug(
+            "Ignoring unused channel keys for %s: %s", path.name, sorted(kwargs)
+        )
 
-    assert axes.endswith("YX"), axes
-    data = tifffile.memmap(path, mode="r")
-    shape = data.shape
-    print(f"src:{Path(path).name}, shape:{shape}, dtype:{data.dtype}, axes: {axes}")
-    # Instead of: assert len(axes) == len(shape)
-    # Try forcing them to match:
-    if len(axes) != len(shape):
-        # Common issue: tifffile adds axes for dimensions of size 1
-        # that memmap might have stripped.
+    raw, axes = _open_tiff(path)
+    logger.info(
+        "src:%s shape:%s dtype:%s axes:%s", path.name, raw.shape, raw.dtype, axes
+    )
+    data = _to_tczyx(raw, axes)
+    n_t, n_c, n_z, src_h, src_w = data.shape
+
+    # ---- validation ------------------------------------------------------- #
+    if not 1 <= useC <= n_c:
+        raise IndexError(f"{path.name}: channel {useC} requested, file has {n_c}.")
+    if padZ < 0 or padZ + slices > n_z:
         raise ValueError(
-            f"Metadata axes {axes} ({len(axes)}) don't match data shape {shape} ({len(shape)})"
+            f"{path.name}: need padZ ({padZ}) + slices ({slices}) <= Z ({n_z})."
+        )
+    if n_t != 1 and n_t < frames:
+        raise ValueError(f"{path.name}: {frames} frames requested, file has {n_t}.")
+
+    dtype = data.dtype.newbyteorder("=")  # native byte order for OpenCV
+    if dtype not in _CV2_DTYPES:
+        raise TypeError(
+            f"{path.name}: dtype {dtype} is not supported by OpenCV warping."
         )
 
-    axes_to_idx = {c: i for i, c in enumerate(axes)}
-    dims = {c: shape[i] for i, c in enumerate(axes)}
+    # Lazy view: selected channel and Z range only.
+    data = data[:, useC - 1, padZ : padZ + slices]
 
-    target_c_idx = useC - 1
-    if 0 > target_c_idx or target_c_idx > dims.get("C", 1):
-        raise IndexError(
-            f"Channel {useC} requested, but only {dims.get('C')} channels exist."
-        )
-
-    actual_z = dims.get("Z", 1)
-    expected_z = actual_z - padZ
-    if padZ >= actual_z and (actual_z - padZ) == slices:
-        raise ValueError(f"Z-Slice Mismatch: MIF expects {padZ} < {actual_z}")
-    M = rigid(scaleX, scaleY, rotXY, transX, transY)
-    M_inv = np.linalg.inv(M)
-
-    # Create a grid of (x, y) coordinates
-    grid = np.indices((height, width), dtype=np.float32)
-
-    # To get your (3, N) matrix for the affine transformation:
-    coords = np.vstack(
-        [
-            grid[1].reshape(1, -1),  # X
-            grid[0].reshape(1, -1),  # Y
-            np.ones((1, height * width), dtype=np.float32),
-        ]
+    # Fold flips + rigid transform into one affine matrix (src -> dst).
+    M = rigid(scaleX, scaleY, rotXY, transX, transY) @ _flip_matrix(
+        flipX, flipY, src_w, src_h
     )
-    # 2. Apply your affine/perspective matrix M to the grid
-    # M is your 3x3 matrix
-    transformed_coords = M_inv @ coords
-    # Perspective division
-    map_x = (
-        (transformed_coords[0] / transformed_coords[2])
-        .reshape(height, width)
-        .astype(np.float32)
-    )
-    map_y = (
-        (transformed_coords[1] / transformed_coords[2])
-        .reshape(height, width)
-        .astype(np.float32)
-    )
+    affine = M[:2]
 
-    idx = np.arange(frames, dtype=int)
-    batched_idx = np.array_split(idx, max(1, (frames // batchsize)))
-
-    for batch in batched_idx:
-        # we read a batch of data to reduce the io access
-        if "T" in axes_to_idx:
-            batch_data = np.take(data, axis=axes_to_idx["T"], indices=batch)
-        else:
-            batch_data = data[None, ...]
-
-        if "C" in dims:
-            assert dims["C"] >= useC, f"{useC} is invalid"
-            # Add 1 if channel T was padded in the first dimension.
-            C_idx = axes_to_idx["C"] + int("T" not in axes_to_idx)
-            batch_data = np.take(
-                batch_data,
-                axis=C_idx,
-                indices=useC - 1,
+    def warp(vol: np.ndarray) -> np.ndarray:
+        out = np.empty((slices, height, width), dtype=dtype)
+        for z, plane in enumerate(vol):
+            out[z] = cv2.warpAffine(
+                np.ascontiguousarray(plane, dtype=dtype),
+                affine,
+                (width, height),
+                flags=interpolation,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
             )
+        return out
 
-        if flipX:
-            batch_data = np.flip(batch_data, -1)
-        if flipY:
-            batch_data = np.flip(batch_data, -2)
+    # ---- iteration -------------------------------------------------------- #
+    if n_t == 1 and frames > 1:
+        # Static image: warp once and repeat it for every frame.
+        static = warp(np.asarray(data[0]))
+        static.flags.writeable = False
+        for _ in range(frames):
+            yield static
+        return
 
-        for src in batch_data:
-
-            # wrapping single channel in list to make it iterable.
-            if "Z" not in dims:
-                src = [src]
-
-            src = src[padZ:actual_z]
-            # 3. Apply the map to all slices in the Z-stack
-            # This moves the loop into C++ internal logic
-            # Converting data type to little endian
-            dtype = src[0].dtype.newbyteorder("L")
-            final_z_stack = np.zeros((expected_z, height, width), dtype=dtype)
-            for i, slice_z in enumerate(src):
-                cv2.remap(
-                    src=slice_z.astype(dtype),
-                    map1=map_x,
-                    map2=map_y,
-                    interpolation=cv2.INTER_CUBIC,
-                    dst=final_z_stack[i],
-                    borderMode=cv2.BORDER_CONSTANT,
-                )
-
-            yield final_z_stack
+    step = max(1, int(batchsize))
+    for t0 in range(0, frames, step):
+        batch = np.asarray(data[t0 : min(t0 + step, frames)])  # one read per batch
+        for vol in batch:
+            yield warp(vol)
 
 
+# --------------------------------------------------------------------------- #
+# MIF parsing
+# --------------------------------------------------------------------------- #
 def parse_raw_str(x: str):
+    """Convert a MIF value to int / float / bool, falling back to str."""
     try:
         ret = float(x)
-        return int(ret) if ret.is_integer() else ret
     except ValueError:
         pass
+    else:
+        return int(ret) if ret.is_integer() else ret
 
-    true_flags = ("true", "t", "1", "y", "yes")
-    false_flags = ("false", "f", "0", "n", "no")
-    if x.lower() in true_flags or x.lower() in false_flags:
-        return x.lower() in true_flags
-
+    lowered = x.lower()
+    if lowered in ("true", "t", "y", "yes"):
+        return True
+    if lowered in ("false", "f", "n", "no"):
+        return False
     return x
 
 
 class MIFLoader:
+    """Read a .mif description and stream (C, Z, Y, X) volumes frame by frame."""
+
+    axes = CANONICAL_AXES
+
     def __init__(self, mif_path: os.PathLike):
         mif_path = Path(mif_path)
-        mif_obj = mif_path.open("r")
-        metadata = {}
-        channel_props = defaultdict(dict)
-        regex = re.compile(r"^([a-zA-Z]+)(\d+)?\s*=\s*(\S+);$")
-        for line in mif_obj.readlines():
-            res = regex.match(line)
-            if res is None:
-                continue
-            key, gp, val = res.group(1), res.group(2), res.group(3)
+        metadata: dict = {}
+        channel_props: dict[int, dict] = defaultdict(dict)
 
-            val = parse_raw_str(val)
-            # Only the attributes end with number will be assigned to channels group.
-            if gp is None:
+        for line in mif_path.read_text().splitlines():
+            m = _LINE_RE.match(line)
+            if m is None:
+                continue
+            key, group, raw = m.groups()
+            val = parse_raw_str(raw)
+            # Keys ending in a number belong to that channel.
+            if group is None:
                 metadata[key] = val
             else:
-                channel_props[gp][key] = val
+                channel_props[int(group)][key] = val
 
-        for k in channel_props:
-            p = Path(channel_props[k]["path"])
+        missing = [k for k in ("width", "height") if k not in metadata]
+        if missing:
+            raise ValueError(f"{mif_path.name}: missing required keys {missing}")
+        if not channel_props:
+            raise ValueError(f"{mif_path.name}: no channels defined")
 
-            if not p.is_absolute():
-                # If the file is not point to the correct
-                p = mif_path.parent.joinpath(p)
-            channel_props[k]["path"] = p
-            channel_props[k]["useC"] = channel_props[k].get("useC", 1)
+        for ch, props in channel_props.items():
+            if "path" not in props:
+                raise ValueError(f"{mif_path.name}: channel {ch} has no 'path'")
+            p = Path(str(props["path"]))
+            props["path"] = p if p.is_absolute() else mif_path.parent / p
+            props.setdefault("useC", 1)
 
-        width = metadata["width"]
-        height = metadata["height"]
-        slices = metadata.get("slices", 1)
-        frames = metadata.get("frames", 1)
+        width = int(metadata["width"])
+        height = int(metadata["height"])
+        slices = int(metadata.get("slices", 1))
+        frames = int(metadata.get("frames", 1))
 
+        self.metadata = metadata
+        self.channel_props = dict(sorted(channel_props.items()))
         # T, C, Z, Y, X
-        self.shape = (frames, len(channel_props), slices, height, width)
-        self.axes = "TCZYX"
-        self.channel_props = {int(k): v for k, v in channel_props.items()}
+        self.shape = (frames, len(self.channel_props), slices, height, width)
 
-    def iter(self, order: Optional[Sequence[int]] = None) -> Generator[np.ndarray]:
-        """Yield the image stack with axes (C, Z, Y, X)"""
-        if order is None:
-            order = sorted(self.channel_props.keys())
-        T, C, Z, Y, X = self.shape
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        return self.iter()
+
+    def iter(self, order: Sequence[int] | None = None) -> Iterator[np.ndarray]:
+        """Yield one (C, Z, Y, X) stack per frame."""
+        order = list(self.channel_props) if order is None else list(order)
+        unknown = [ch for ch in order if ch not in self.channel_props]
+        if unknown:
+            raise KeyError(
+                f"Unknown channel(s) {unknown}; available: {list(self.channel_props)}"
+            )
+
+        T, _, Z, Y, X = self.shape
         loaders = [
             load_mif_channel(
                 width=X, height=Y, frames=T, slices=Z, **self.channel_props[ch]
             )
             for ch in order
         ]
-        for vol in zip(*loaders):
-            vol = np.stack(vol, axis=0)
-            yield vol
+        for vols in zip(*loaders):
+            yield np.stack(vols, axis=0)
